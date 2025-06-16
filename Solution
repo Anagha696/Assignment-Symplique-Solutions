@@ -1,0 +1,115 @@
+Problem Overview
+
+Service: Serverless in Azure
+
+Database: Azure Cosmos DB
+
+Record Size: ~300 KB
+
+Record Volume: > 2 million
+
+Access Pattern: Read-heavy, but records older than 3 months are rarely accessed
+
+Constraints:
+
+Keep old records available with latency of seconds
+
+No downtime or data loss
+
+No change to existing API contracts
+
+Easy to implement and maintain
+
+Proposed Solution: Hot-Cold Storage Architecture with Azure Cosmos DB and Azure Blob Storage
+
+1. Hot-Cold Data Tiering
+
+Hot Tier: Azure Cosmos DB (retains most recent 3 months of billing records)
+
+Cold Tier: Azure Blob Storage (stores archived records older than 3 months in compressed JSON format)
+
+2. Serverless Functions
+
+Azure Function runs on a Timer Trigger daily or weekly:
+
+Moves records older than 3 months from Cosmos DB to Blob Storage
+
+Deletes archived records from Cosmos DB
+
+3. API Access Logic (Proxy/Facade Pattern)
+
+Existing APIs remain unchanged
+
+When a read request is made:
+
+Query Cosmos DB
+
+If not found, fallback to Blob Storage (cold read)
+
+4. Monitoring & Logging
+
+Use Application Insights and Azure Monitor to trace performance and failures
+
+Architecture:
+Timer Trigger Function --> Cosmos DB --> Azure Blob Storage
+                                   ^
+                                   |
+Client API Requests --> API Gateway --> Azure Function App (API Layer)
+
+> We need to wrote a function finds records older than 90 days, uploads them to Azure Blob Storage, and deletes them from Cosmos DB.
+from azure.cosmos import CosmosClient
+from azure.storage.blob import BlobServiceClient
+import json, datetime
+
+COSMOS_ENDPOINT = "<your-cosmos-endpoint>"
+COSMOS_KEY = "<your-cosmos-key>"
+BLOB_CONN = "<your-blob-connection-string>"
+
+def archive_old_records():
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=90)
+
+    # Connect to Cosmos DB
+    cosmos = CosmosClient(COSMOS_ENDPOINT, COSMOS_KEY)
+    container = cosmos.get_database_client("billing-db").get_container_client("records")
+
+    # Query old records
+    query = "SELECT * FROM c WHERE c.timestamp < @cutoff"
+    records = container.query_items(
+        query,
+        parameters=[{"name": "@cutoff", "value": cutoff.isoformat()}],
+        enable_cross_partition_query=True
+    )
+
+    # Connect to Blob Storage
+    blob_service = BlobServiceClient.from_connection_string(BLOB_CONN)
+    blob_container = blob_service.get_container_client("billing-archive")
+
+    # Upload to blob and delete from DB
+    for record in records:
+        blob_name = f"{record['id']}.json"
+        blob_data = json.dumps(record)
+        blob_container.upload_blob(name=blob_name, data=blob_data, overwrite=True)
+        container.delete_item(record, partition_key=record['partitionKey'])
+
+archive_old_records()
+
+
+> We need to write a logic that tries to read from Cosmos DB first. If not found, it tries from Blob Storage.
+from azure.storage.blob import BlobServiceClient
+import json
+
+BLOB_CONN = "<your-blob-connection-string>"
+
+def get_billing_record(record_id):
+    try:
+        return query_cosmos(record_id)  # Replace with actual Cosmos DB call
+    except:
+        return read_from_blob(record_id)
+
+def read_from_blob(record_id):
+    blob_service = BlobServiceClient.from_connection_string(BLOB_CONN)
+    container = blob_service.get_container_client("billing-archive")
+    blob = container.get_blob_client(f"{record_id}.json")
+    data = blob.download_blob().readall()
+    return json.loads(data)
+
